@@ -21,6 +21,9 @@ pub struct FetchMessage {
     orientation: Option<FetchOrientation>,
     /// Fetch offset/position for scrollable cursors
     offset: i64,
+    /// TTC message sequence number — must continue the connection's sequence;
+    /// sending 0 desyncs the server (it replies with a break MARKER).
+    sequence_number: u8,
 }
 
 impl FetchMessage {
@@ -31,7 +34,13 @@ impl FetchMessage {
             num_rows,
             orientation: None,
             offset: 0,
+            sequence_number: 0,
         }
+    }
+
+    /// Set the TTC sequence number (from `Connection::next_sequence_number`).
+    pub fn set_sequence_number(&mut self, seq: u8) {
+        self.sequence_number = seq;
     }
 
     /// Create a new scrollable fetch message
@@ -46,17 +55,29 @@ impl FetchMessage {
             num_rows,
             orientation: Some(orientation),
             offset,
+            sequence_number: 0,
         }
     }
 
     /// Build the fetch request packet
-    pub fn build_request(&self, _caps: &Capabilities) -> Result<Bytes> {
+    pub fn build_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
+
+        // Data flags (2 bytes) — written into the payload so packet_len counts
+        // them, exactly as ExecuteMessage does. (Writing them separately after
+        // the header left the length field 2 bytes short, truncating the request
+        // and hanging the call.)
+        buf.write_u16_be(0)?;
 
         // Write message header
         buf.write_u8(MessageType::Function as u8)?;
         buf.write_u8(FunctionCode::Fetch as u8)?;
-        buf.write_u8(0)?; // Sequence number
+        buf.write_u8(self.sequence_number)?; // Sequence number (0 desyncs the server)
+        // Token number, present on 23ai (mirrors the execute header); without
+        // it the server waits for the rest of the message and the fetch hangs.
+        if caps.ttc_field_version >= 18 {
+            buf.write_ub8(0)?;
+        }
 
         // Write fetch body
         buf.write_ub4(self.cursor_id as u32)?;
@@ -74,17 +95,22 @@ impl FetchMessage {
 
         let mut packet = BytesMut::with_capacity(packet_len);
 
-        // Packet header
-        packet.put_u16(packet_len as u16); // Length
-        packet.put_u16(0); // Checksum
+        // Packet header. The length field MUST match the connection's SDU size:
+        // a large-SDU connection uses a 4-byte length, otherwise a 2-byte length
+        // + checksum (same as ExecuteMessage). Writing the wrong width makes the
+        // server misread the packet length and abort the call with a break MARKER
+        // (which is what broke fetch_more on large-SDU / pre-23c connections).
+        if large_sdu {
+            packet.put_u32(packet_len as u32); // Length (large SDU)
+        } else {
+            packet.put_u16(packet_len as u16); // Length
+            packet.put_u16(0); // Checksum (unused for large SDU)
+        }
         packet.put_u8(PacketType::Data as u8);
         packet.put_u8(0); // Flags
         packet.put_u16(0); // Header checksum
 
-        // Data flags (2 bytes)
-        packet.put_u16(0);
-
-        // Payload
+        // Payload (includes the 2-byte data flags written above)
         packet.extend_from_slice(&payload);
 
         Ok(packet.freeze())
@@ -117,7 +143,7 @@ mod tests {
         let msg = FetchMessage::new(1, 100);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Check packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);
